@@ -3,7 +3,6 @@ package grpc
 import (
 	"context"
 	gonet "net"
-	"runtime"
 	sync "sync"
 	"time"
 
@@ -20,7 +19,6 @@ import (
 	"github.com/xtls/xray-core/transport/internet/tls"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
-	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 )
@@ -55,11 +53,12 @@ var (
 func dialgRPC(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (net.Conn, error) {
 	grpcSettings := streamSettings.ProtocolSettings.(*Config)
 
-	conn, err := getGrpcClient(ctx, dest, streamSettings)
+	clientConn, err := getGrpcClient(ctx, dest, streamSettings)
 	if err != nil {
 		return nil, errors.New("Cannot dial gRPC").Base(err)
 	}
-	client := encoding.NewGRPCServiceClient(conn)
+
+	client := encoding.NewGRPCServiceClient(clientConn)
 	if grpcSettings.MultiMode {
 		errors.LogDebug(ctx, "using gRPC multi mode service name: `"+grpcSettings.getServiceName()+"` stream name: `"+grpcSettings.getTunMultiStreamName()+"`")
 		grpcService, err := client.(encoding.GRPCServiceClientX).TunMultiCustomName(ctx, grpcSettings.getServiceName(), grpcSettings.getTunMultiStreamName())
@@ -78,7 +77,7 @@ func dialgRPC(ctx context.Context, dest net.Destination, streamSettings *interne
 	return encoding.NewHunkConn(grpcService, nil), nil
 }
 
-func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (*grpc.ClientConn, error) {
+func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (grpc.ClientConnInterface, error) {
 
 	clientConnCacheInit.Do(func() {
 		clientConnCache = cache.NewLru(ClientConnCacheSize)
@@ -94,13 +93,12 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 
 	// Check if we have a cached connection that's still valid
 	if cached, found := clientConnCache.Get(key); found {
-		if client, ok := cached.(*grpc.ClientConn); ok {
-			state := client.GetState()
-			if state != connectivity.Shutdown && state != connectivity.TransientFailure {
+		if entry, ok := cached.(*pooledClient); ok {
+			if client, ok := entry.acquire(); ok {
 				return client, nil
 			}
-			client.Close()
 		}
+		clientConnCache.Delete(key)
 	}
 
 	dialOptions := []grpc.DialOption{
@@ -198,15 +196,19 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 		dialOptions...,
 	)
 
-	if err == nil {
-		// Store the connection in LRU cache
-		clientConnCache.Put(key, conn)
-		runtime.AddCleanup(conn, func(c *grpc.ClientConn) {
-			if c != nil {
-				c.Close()
-			}
-		}, conn)
+	if err != nil {
+		return nil, err
 	}
 
-	return conn, err
+	entry := newPooledClient(conn, key)
+	clientConnCache.Put(key, entry)
+
+	client, ok := entry.acquire()
+	if !ok {
+		conn.Close()
+		clientConnCache.Delete(key)
+		return nil, errors.New("failed to acquire gRPC client")
+	}
+
+	return client, nil
 }

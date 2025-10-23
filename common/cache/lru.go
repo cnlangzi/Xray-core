@@ -11,6 +11,7 @@ type Lru interface {
 	GetKeyFromValue(value interface{}) (key interface{}, ok bool)
 	PeekKeyFromValue(value interface{}) (key interface{}, ok bool) // Peek means check but NOT bring to top
 	Put(key, value interface{})
+	Delete(key interface{})
 }
 
 type lru struct {
@@ -86,4 +87,18 @@ func (l *lru) Put(key, value interface{}) {
 		}
 	}
 	l.mu.Unlock()
+}
+
+func (l *lru) Delete(key interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if v, ok := l.keyToElement.Load(key); ok {
+		element := v.(*list.Element)
+		l.doubleLinkedlist.Remove(element)
+		l.keyToElement.Delete(key)
+		if entry, ok := element.Value.(*lruElement); ok {
+			l.valueToElement.Delete(entry.value)
+		}
+	}
 }
