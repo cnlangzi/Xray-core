@@ -2,6 +2,8 @@ package grpc
 
 import (
 	"context"
+	"crypto/md5"
+	"fmt"
 	gonet "net"
 	sync "sync"
 	"time"
@@ -38,9 +40,46 @@ type dialerConf struct {
 	*internet.MemoryStreamConfig
 }
 
+// generateCacheKey creates a content-based cache key for gRPC connections
+func (d dialerConf) generateCacheKey() string {
+	// Create a string representation of the key components
+	keyStr := fmt.Sprintf("%s:%s:%s:%s:%s",
+		d.Address.String(),
+		d.Port.String(),
+		d.Network.String(),
+		d.ProtocolName,
+		d.SecurityType,
+	)
+
+	// Add protocol-specific settings hash if available
+	if grpcSettings, ok := d.ProtocolSettings.(*Config); ok {
+		keyStr += fmt.Sprintf(":%s:%s:%t:%d:%d:%t",
+			grpcSettings.ServiceName,
+			grpcSettings.Authority,
+			grpcSettings.MultiMode,
+			grpcSettings.IdleTimeout,
+			grpcSettings.HealthCheckTimeout,
+			grpcSettings.PermitWithoutStream,
+		)
+	}
+
+	// Add security settings hash
+	if d.SecuritySettings != nil {
+		if tlsConfig, ok := d.SecuritySettings.(*tls.Config); ok {
+			keyStr += fmt.Sprintf(":tls:%s:%s", tlsConfig.ServerName, tlsConfig.Fingerprint)
+		}
+	}
+
+	// Generate MD5 hash of the key string
+	hash := md5.Sum([]byte(keyStr))
+	return fmt.Sprintf("%x", hash)
+}
+
 var (
 	clientConnCache     cache.Lru
 	clientConnCacheInit *sync.Once
+	// ClientConnCacheSize is the maximum number of cached gRPC connections
+	// Can be overridden via build tags or environment variables in production
 	ClientConnCacheSize = 1000
 
 	ReadBufSize  = 4 * 1024
@@ -58,8 +97,11 @@ func onClientConnEvicted(key, value any) {
 func dialgRPC(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (net.Conn, error) {
 	grpcSettings := streamSettings.ProtocolSettings.(*Config)
 
-	conn, err := getGrpcClient(ctx, dest, streamSettings)
+	gctx, gcf := context.WithTimeout(ctx, 10*time.Minute)
+
+	conn, err := getGrpcClient(gctx, dest, streamSettings)
 	if err != nil {
+		gcf()
 		return nil, errors.New("Cannot dial gRPC").Base(err)
 	}
 
@@ -68,25 +110,29 @@ func dialgRPC(ctx context.Context, dest net.Destination, streamSettings *interne
 		errors.LogDebug(ctx, "using gRPC multi mode service name: `"+grpcSettings.getServiceName()+"` stream name: `"+grpcSettings.getTunMultiStreamName()+"`")
 		grpcService, err := client.(encoding.GRPCServiceClientX).TunMultiCustomName(ctx, grpcSettings.getServiceName(), grpcSettings.getTunMultiStreamName())
 		if err != nil {
+			gcf()
 			return nil, errors.New("Cannot dial gRPC").Base(err)
 		}
-		return encoding.NewMultiHunkConn(grpcService, nil), nil
+
+		return encoding.NewMultiHunkConn(grpcService, gcf), nil
 	}
 
 	errors.LogDebug(ctx, "using gRPC tun mode service name: `"+grpcSettings.getServiceName()+"` stream name: `"+grpcSettings.getTunStreamName()+"`")
 	grpcService, err := client.(encoding.GRPCServiceClientX).TunCustomName(ctx, grpcSettings.getServiceName(), grpcSettings.getTunStreamName())
 	if err != nil {
+		gcf()
 		return nil, errors.New("Cannot dial gRPC").Base(err)
 	}
 
-	return encoding.NewHunkConn(grpcService, nil), nil
+	return encoding.NewHunkConn(grpcService, gcf), nil
 }
 
 func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (*grpc.ClientConn, error) {
-
-	clientConnCacheInit.Do(func() {
-		clientConnCache = cache.NewLruWith(ClientConnCacheSize, onClientConnEvicted)
-	})
+	if ClientConnCacheSize > 0 {
+		clientConnCacheInit.Do(func() {
+			clientConnCache = cache.NewLruWith(ClientConnCacheSize, onClientConnEvicted)
+		})
+	}
 
 	tlsConfig := tls.ConfigFromStreamSettings(streamSettings)
 	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
@@ -94,14 +140,22 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 	grpcSettings := streamSettings.ProtocolSettings.(*Config)
 
 	// Create a cache key based on destination and stream settings
-	key := dialerConf{dest, streamSettings}
+	key := dialerConf{dest, streamSettings}.generateCacheKey()
 
 	// Check if we have a cached connection that's still valid
 	if cached, found := clientConnCache.Get(key); found {
 		if conn, ok := cached.(*grpc.ClientConn); ok {
-			return conn, nil
+			// Check if connection is still alive
+			if conn.GetState().String() != "SHUTDOWN" && conn.GetState().String() != "TRANSIENT_FAILURE" {
+				return conn, nil
+			}
+			// Connection is dead, remove from cache
+			clientConnCache.Delete(key)
+			conn.Close()
+		} else {
+			// Invalid cache entry, remove it
+			clientConnCache.Delete(key)
 		}
-		clientConnCache.Delete(key)
 	}
 
 	dialOptions := []grpc.DialOption{
