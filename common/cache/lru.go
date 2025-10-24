@@ -5,6 +5,8 @@ import (
 	"sync"
 )
 
+type EvictCallback func(key, value any)
+
 // Lru simple, fast lru cache implementation
 type Lru interface {
 	Get(key interface{}) (value interface{}, ok bool)
@@ -12,6 +14,11 @@ type Lru interface {
 	PeekKeyFromValue(value interface{}) (key interface{}, ok bool) // Peek means check but NOT bring to top
 	Put(key, value interface{})
 	Delete(key interface{})
+	// OnEvicted sets a callback which will be invoked when a key/value pair is removed
+	// from the cache, either due to explicit Delete or automatic eviction on capacity.
+	// The callback is executed after the internal structures are updated and outside the
+	// internal lock to avoid deadlocks.
+	OnEvicted(EvictCallback)
 }
 
 type lru struct {
@@ -20,6 +27,7 @@ type lru struct {
 	keyToElement     *sync.Map
 	valueToElement   *sync.Map
 	mu               *sync.Mutex
+	onEvicted        func(key, value interface{})
 }
 
 type lruElement struct {
@@ -71,34 +79,72 @@ func (l *lru) PeekKeyFromValue(value interface{}) (key interface{}, ok bool) {
 func (l *lru) Put(key, value interface{}) {
 	l.mu.Lock()
 	e := &lruElement{key, value}
+	var cb func(key, value interface{})
+	var removedKey, removedValue interface{}
+
 	if v, ok := l.keyToElement.Load(key); ok {
 		element := v.(*list.Element)
+		// update value
 		element.Value = e
 		l.doubleLinkedlist.MoveToFront(element)
+		// NOTE: valueToElement map isn't updated for old value in existing behavior.
+		// To preserve current semantics, we do not modify valueToElement here.
 	} else {
 		element := l.doubleLinkedlist.PushFront(e)
 		l.keyToElement.Store(key, element)
 		l.valueToElement.Store(value, element)
 		if l.doubleLinkedlist.Len() > l.capacity {
 			toBeRemove := l.doubleLinkedlist.Back()
-			l.doubleLinkedlist.Remove(toBeRemove)
-			l.keyToElement.Delete(toBeRemove.Value.(*lruElement).key)
-			l.valueToElement.Delete(toBeRemove.Value.(*lruElement).value)
+			if toBeRemove != nil {
+				// capture key/value before removal
+				if entry, ok := toBeRemove.Value.(*lruElement); ok {
+					removedKey, removedValue = entry.key, entry.value
+				}
+				l.doubleLinkedlist.Remove(toBeRemove)
+				if entry, ok := toBeRemove.Value.(*lruElement); ok {
+					l.keyToElement.Delete(entry.key)
+					l.valueToElement.Delete(entry.value)
+				}
+				if l.onEvicted != nil && removedKey != nil {
+					cb = l.onEvicted
+				}
+			}
 		}
 	}
 	l.mu.Unlock()
+
+	// Invoke callback outside the lock to avoid potential deadlocks
+	if cb != nil {
+		cb(removedKey, removedValue)
+	}
 }
 
 func (l *lru) Delete(key interface{}) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
+	var cb func(key, value interface{})
+	var removedKey, removedValue interface{}
 
 	if v, ok := l.keyToElement.Load(key); ok {
 		element := v.(*list.Element)
 		l.doubleLinkedlist.Remove(element)
 		l.keyToElement.Delete(key)
 		if entry, ok := element.Value.(*lruElement); ok {
+			removedKey, removedValue = entry.key, entry.value
 			l.valueToElement.Delete(entry.value)
 		}
+		if l.onEvicted != nil {
+			cb = l.onEvicted
+		}
 	}
+	l.mu.Unlock()
+
+	if cb != nil {
+		cb(removedKey, removedValue)
+	}
+}
+
+func (l *lru) OnEvicted(f EvictCallback) {
+	l.mu.Lock()
+	l.onEvicted = f
+	l.mu.Unlock()
 }
