@@ -14,11 +14,6 @@ type Lru interface {
 	PeekKeyFromValue(value interface{}) (key interface{}, ok bool) // Peek means check but NOT bring to top
 	Put(key, value interface{})
 	Delete(key interface{})
-	// OnEvicted sets a callback which will be invoked when a key/value pair is removed
-	// from the cache, either due to explicit Delete or automatic eviction on capacity.
-	// The callback is executed after the internal structures are updated and outside the
-	// internal lock to avoid deadlocks.
-	OnEvicted(EvictCallback)
 }
 
 type lru struct {
@@ -37,12 +32,17 @@ type lruElement struct {
 
 // NewLru initializes a lru cache
 func NewLru(cap int) Lru {
+	return NewLruWith(cap, nil)
+}
+
+func NewLruWith(cap int, onEvicted EvictCallback) Lru {
 	return &lru{
 		capacity:         cap,
 		doubleLinkedlist: list.New(),
 		keyToElement:     new(sync.Map),
 		valueToElement:   new(sync.Map),
 		mu:               new(sync.Mutex),
+		onEvicted:        onEvicted,
 	}
 }
 
@@ -141,10 +141,4 @@ func (l *lru) Delete(key interface{}) {
 	if cb != nil {
 		cb(removedKey, removedValue)
 	}
-}
-
-func (l *lru) OnEvicted(f EvictCallback) {
-	l.mu.Lock()
-	l.onEvicted = f
-	l.mu.Unlock()
 }

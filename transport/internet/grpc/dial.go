@@ -6,7 +6,6 @@ import (
 	sync "sync"
 	"time"
 
-	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/cache"
 	c "github.com/xtls/xray-core/common/ctx"
 	"github.com/xtls/xray-core/common/errors"
@@ -17,9 +16,9 @@ import (
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
+
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
-	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 )
@@ -34,12 +33,6 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	return stat.Connection(conn), nil
 }
 
-func init() {
-	common.Must(internet.RegisterTransportDialer(protocolName, Dial))
-
-	clientConnCacheInit = &sync.Once{}
-}
-
 type dialerConf struct {
 	net.Destination
 	*internet.MemoryStreamConfig
@@ -49,11 +42,15 @@ var (
 	clientConnCache     cache.Lru
 	clientConnCacheInit *sync.Once
 	ClientConnCacheSize = 1000
+
+	ReadBufSize  = 4 * 1024
+	WriteBufSize = 4 * 1024
+	ConnWindow   = 256 * 1024
 )
 
 func onClientConnEvicted(key, value any) {
 	c, ok := value.(*grpc.ClientConn)
-	if ok && c != nil && c.GetState() != connectivity.Shutdown {
+	if ok && c != nil {
 		c.Close()
 	}
 }
@@ -88,8 +85,7 @@ func dialgRPC(ctx context.Context, dest net.Destination, streamSettings *interne
 func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (*grpc.ClientConn, error) {
 
 	clientConnCacheInit.Do(func() {
-		clientConnCache = cache.NewLru(ClientConnCacheSize)
-		clientConnCache.OnEvicted(onClientConnEvicted)
+		clientConnCache = cache.NewLruWith(ClientConnCacheSize, onClientConnEvicted)
 	})
 
 	tlsConfig := tls.ConfigFromStreamSettings(streamSettings)
@@ -118,6 +114,9 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 			},
 			MinConnectTimeout: 5 * time.Second,
 		}),
+		grpc.WithReadBufferSize(ReadBufSize),
+		grpc.WithWriteBufferSize(WriteBufSize),
+		grpc.WithInitialConnWindowSize(int32(ConnWindow)),
 		grpc.WithContextDialer(func(gctx context.Context, s string) (gonet.Conn, error) {
 			select {
 			case <-gctx.Done():
