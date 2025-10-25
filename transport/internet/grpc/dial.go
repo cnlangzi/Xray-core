@@ -92,15 +92,8 @@ func onClientConnEvicted(key, value any) {
 	if value == nil {
 		return
 	}
-
 	c, ok := value.(*grpc.ClientConn)
-
 	if ok && c != nil {
-		defer func() {
-			if err := recover(); err != nil {
-				errors.LogDebug(context.TODO(), "Close grpc Client Conn", err)
-			}
-		}()
 		c.Close()
 	}
 }
