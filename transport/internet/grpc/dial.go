@@ -224,6 +224,10 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 
 	dialOptions = append(dialOptions, grpc.WithTransportCredentials(insecure.NewCredentials()))
 
+	if ClientConnIdleTimeout > 0 {
+		dialOptions = append(dialOptions, grpc.WithIdleTimeout(ClientConnIdleTimeout))
+	}
+
 	authority := ""
 	if grpcSettings.Authority != "" {
 		authority = grpcSettings.Authority
@@ -240,8 +244,6 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 			Timeout:             time.Second * time.Duration(grpcSettings.HealthCheckTimeout),
 			PermitWithoutStream: grpcSettings.PermitWithoutStream,
 		}))
-	} else if ClientConnIdleTimeout > 0 {
-		dialOptions = append(dialOptions, grpc.WithIdleTimeout(ClientConnIdleTimeout))
 	}
 
 	if grpcSettings.InitialWindowsSize > 0 {
