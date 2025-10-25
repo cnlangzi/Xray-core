@@ -80,7 +80,8 @@ var (
 	clientConnCacheInit *sync.Once
 	// ClientConnCacheSize is the maximum number of cached gRPC connections
 	// Can be overridden via build tags or environment variables in production
-	ClientConnCacheSize = 1000
+	ClientConnCacheSize   = 1000
+	ClientConnIdleTimeout = 1 * time.Minute
 
 	ReadBufSize  = 4 * 1024
 	WriteBufSize = 4 * 1024
@@ -88,8 +89,18 @@ var (
 )
 
 func onClientConnEvicted(key, value any) {
+	if value == nil {
+		return
+	}
+
 	c, ok := value.(*grpc.ClientConn)
+
 	if ok && c != nil {
+		defer func() {
+			if err := recover(); err != nil {
+				errors.LogDebug(context.TODO(), "Close grpc Client Conn", err)
+			}
+		}()
 		c.Close()
 	}
 }
@@ -97,11 +108,8 @@ func onClientConnEvicted(key, value any) {
 func dialgRPC(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (net.Conn, error) {
 	grpcSettings := streamSettings.ProtocolSettings.(*Config)
 
-	gctx, gcf := context.WithTimeout(ctx, 10*time.Minute)
-
-	conn, err := getGrpcClient(gctx, dest, streamSettings)
+	conn, err := getGrpcClient(ctx, dest, streamSettings)
 	if err != nil {
-		gcf()
 		return nil, errors.New("Cannot dial gRPC").Base(err)
 	}
 
@@ -110,21 +118,19 @@ func dialgRPC(ctx context.Context, dest net.Destination, streamSettings *interne
 		errors.LogDebug(ctx, "using gRPC multi mode service name: `"+grpcSettings.getServiceName()+"` stream name: `"+grpcSettings.getTunMultiStreamName()+"`")
 		grpcService, err := client.(encoding.GRPCServiceClientX).TunMultiCustomName(ctx, grpcSettings.getServiceName(), grpcSettings.getTunMultiStreamName())
 		if err != nil {
-			gcf()
 			return nil, errors.New("Cannot dial gRPC").Base(err)
 		}
 
-		return encoding.NewMultiHunkConn(grpcService, gcf), nil
+		return encoding.NewMultiHunkConn(grpcService, nil), nil
 	}
 
 	errors.LogDebug(ctx, "using gRPC tun mode service name: `"+grpcSettings.getServiceName()+"` stream name: `"+grpcSettings.getTunStreamName()+"`")
 	grpcService, err := client.(encoding.GRPCServiceClientX).TunCustomName(ctx, grpcSettings.getServiceName(), grpcSettings.getTunStreamName())
 	if err != nil {
-		gcf()
 		return nil, errors.New("Cannot dial gRPC").Base(err)
 	}
 
-	return encoding.NewHunkConn(grpcService, gcf), nil
+	return encoding.NewHunkConn(grpcService, nil), nil
 }
 
 func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (*grpc.ClientConn, error) {
@@ -234,6 +240,8 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 			Timeout:             time.Second * time.Duration(grpcSettings.HealthCheckTimeout),
 			PermitWithoutStream: grpcSettings.PermitWithoutStream,
 		}))
+	} else if ClientConnIdleTimeout > 0 {
+		dialOptions = append(dialOptions, grpc.WithIdleTimeout(ClientConnIdleTimeout))
 	}
 
 	if grpcSettings.InitialWindowsSize > 0 {
@@ -251,7 +259,7 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 		grpcDestHost = dest.Address.IP().String()
 	}
 
-	conn, err := grpc.Dial(
+	conn, err := grpc.NewClient(
 		gonet.JoinHostPort(grpcDestHost, dest.Port.String()),
 		dialOptions...,
 	)
