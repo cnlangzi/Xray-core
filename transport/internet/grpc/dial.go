@@ -263,8 +263,7 @@ func createGrpcConnection(
 		grpcDestHost = dest.Address.IP().String()
 	}
 
-	conn, err := grpc.NewClient(
-		gonet.JoinHostPort(grpcDestHost, dest.Port.String()),
+	conn, err := grpc.Dial(gonet.JoinHostPort(grpcDestHost, dest.Port.String()),
 		dialOptions...,
 	)
 
