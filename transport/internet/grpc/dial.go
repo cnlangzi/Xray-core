@@ -77,14 +77,11 @@ func (d dialerConf) generateCacheKey() string {
 }
 
 var (
-	// ClientConnCacheSize is the default size for Instance store
-	// Used when creating new instances
-	ClientConnCacheSize   = 1000
 	ClientConnIdleTimeout = 1 * time.Minute
 
-	ReadBufSize  = 4 * 1024
-	WriteBufSize = 4 * 1024
-	ConnWindow   = 256 * 1024
+	ReadBufSize  = 2 * 1024
+	WriteBufSize = 2 * 1024
+	ConnWindow   = 64 * 1024
 )
 
 func dialgRPC(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (net.Conn, error) {
@@ -134,8 +131,8 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 
 	// If store is available, try to get stored connection
 	if st != nil {
-		if resource, found := st.Get(key); found {
-			if conn, ok := resource.(*grpc.ClientConn); ok {
+		if it, found := st.Get(key); found {
+			if conn, ok := it.(*grpc.ClientConn); ok {
 				state := conn.GetState()
 				// Only reuse if connection is healthy
 				if state != connectivity.Shutdown && state != connectivity.TransientFailure {
@@ -147,7 +144,7 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 	}
 
 	// Create new connection
-	conn, err := createGrpcConnection(ctx, dest, streamSettings, tlsConfig, realityConfig, sockopt, grpcSettings)
+	conn, err := createGrpcConnection(ctx, dest, tlsConfig, realityConfig, sockopt, grpcSettings)
 	if err != nil {
 		return nil, err
 	}
@@ -164,7 +161,6 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 func createGrpcConnection(
 	ctx context.Context,
 	dest net.Destination,
-	streamSettings *internet.MemoryStreamConfig,
 	tlsConfig *tls.Config,
 	realityConfig *reality.Config,
 	sockopt *internet.SocketConfig,
