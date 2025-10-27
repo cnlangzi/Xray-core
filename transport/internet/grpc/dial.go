@@ -5,14 +5,14 @@ import (
 	"crypto/md5"
 	"fmt"
 	gonet "net"
-	sync "sync"
 	"time"
 
-	"github.com/xtls/xray-core/common/cache"
 	c "github.com/xtls/xray-core/common/ctx"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/features/store"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/grpc/encoding"
 	"github.com/xtls/xray-core/transport/internet/reality"
@@ -21,6 +21,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 )
@@ -76,10 +77,8 @@ func (d dialerConf) generateCacheKey() string {
 }
 
 var (
-	clientConnCache     cache.Lru
-	clientConnCacheInit *sync.Once
-	// ClientConnCacheSize is the maximum number of cached gRPC connections
-	// Can be overridden via build tags or environment variables in production
+	// ClientConnCacheSize is the default size for Instance store
+	// Used when creating new instances
 	ClientConnCacheSize   = 1000
 	ClientConnIdleTimeout = 1 * time.Minute
 
@@ -87,16 +86,6 @@ var (
 	WriteBufSize = 4 * 1024
 	ConnWindow   = 256 * 1024
 )
-
-func onClientConnEvicted(key, value any) {
-	if value == nil {
-		return
-	}
-	c, ok := value.(*grpc.ClientConn)
-	if ok && c != nil {
-		c.Close()
-	}
-}
 
 func dialgRPC(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (net.Conn, error) {
 	grpcSettings := streamSettings.ProtocolSettings.(*Config)
@@ -127,10 +116,12 @@ func dialgRPC(ctx context.Context, dest net.Destination, streamSettings *interne
 }
 
 func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (*grpc.ClientConn, error) {
-	if ClientConnCacheSize > 0 {
-		clientConnCacheInit.Do(func() {
-			clientConnCache = cache.NewLruWith(ClientConnCacheSize, onClientConnEvicted)
-		})
+	// Try to get store from features
+	var st *store.Store
+	if instance := core.FromContext(ctx); instance != nil {
+		if s := instance.GetFeature(store.Type()); s != nil {
+			st = s.(*store.Store)
+		}
 	}
 
 	tlsConfig := tls.ConfigFromStreamSettings(streamSettings)
@@ -138,25 +129,47 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 	sockopt := streamSettings.SocketSettings
 	grpcSettings := streamSettings.ProtocolSettings.(*Config)
 
-	// Create a cache key based on destination and stream settings
+	// Generate cache key once for both Get and Put operations
 	key := dialerConf{dest, streamSettings}.generateCacheKey()
 
-	// Check if we have a cached connection that's still valid
-	if cached, found := clientConnCache.Get(key); found {
-		if conn, ok := cached.(*grpc.ClientConn); ok {
-			// Check if connection is still alive
-			if conn.GetState().String() != "SHUTDOWN" && conn.GetState().String() != "TRANSIENT_FAILURE" {
-				return conn, nil
+	// If store is available, try to get stored connection
+	if st != nil {
+		if resource, found := st.Get(key); found {
+			if conn, ok := resource.(*grpc.ClientConn); ok {
+				state := conn.GetState()
+				// Only reuse if connection is healthy
+				if state != connectivity.Shutdown && state != connectivity.TransientFailure {
+					return conn, nil
+				}
+				// Connection is unhealthy, will be replaced by new connection below
 			}
-			// Connection is dead, remove from cache
-			clientConnCache.Delete(key)
-			conn.Close()
-		} else {
-			// Invalid cache entry, remove it
-			clientConnCache.Delete(key)
 		}
 	}
 
+	// Create new connection
+	conn, err := createGrpcConnection(ctx, dest, streamSettings, tlsConfig, realityConfig, sockopt, grpcSettings)
+	if err != nil {
+		return nil, err
+	}
+
+	// Store connection if store is available
+	if st != nil {
+		st.Put(key, conn)
+	}
+
+	return conn, nil
+}
+
+// createGrpcConnection creates a new gRPC client connection
+func createGrpcConnection(
+	ctx context.Context,
+	dest net.Destination,
+	streamSettings *internet.MemoryStreamConfig,
+	tlsConfig *tls.Config,
+	realityConfig *reality.Config,
+	sockopt *internet.SocketConfig,
+	grpcSettings *Config,
+) (*grpc.ClientConn, error) {
 	dialOptions := []grpc.DialOption{
 		grpc.WithConnectParams(grpc.ConnectParams{
 			Backoff: backoff.Config{
@@ -259,11 +272,5 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 		dialOptions...,
 	)
 
-	if err != nil {
-		return nil, err
-	}
-
-	clientConnCache.Put(key, conn)
-
-	return conn, nil
+	return conn, err
 }

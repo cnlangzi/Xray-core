@@ -17,6 +17,7 @@ import (
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/features/stats"
+	"github.com/xtls/xray-core/features/store"
 	"github.com/xtls/xray-core/transport/internet"
 )
 
@@ -165,7 +166,9 @@ func OptionalFeatures(ctx context.Context, callback interface{}) error {
 // The instance is not started at this point.
 // To ensure Xray instance works properly, the config must contain one Dispatcher, one InboundHandlerManager and one OutboundHandlerManager. Other features are optional.
 func New(config *Config) (*Instance, error) {
-	server := &Instance{ctx: context.Background()}
+	server := &Instance{
+		ctx: context.Background(),
+	}
 
 	done, err := initInstanceWithConfig(config, server)
 	if done {
@@ -176,7 +179,9 @@ func New(config *Config) (*Instance, error) {
 }
 
 func NewWithContext(ctx context.Context, config *Config) (*Instance, error) {
-	server := &Instance{ctx: ctx}
+	server := &Instance{
+		ctx: ctx,
+	}
 
 	done, err := initInstanceWithConfig(config, server)
 	if done {
@@ -210,6 +215,7 @@ func initInstanceWithConfig(config *Config, server *Instance) (bool, error) {
 		Type     interface{}
 		Instance features.Feature
 	}{
+		{store.Type(), store.New()},
 		{dns.ClientType(), localdns.New()},
 		{policy.ManagerType(), policy.DefaultManager{}},
 		{routing.RouterType(), routing.DefaultRouter{}},
@@ -267,6 +273,7 @@ func (s *Instance) Close() error {
 			errs = append(errs, err)
 		}
 	}
+
 	if len(errs) > 0 {
 		return errors.New("failed to close all features").Base(errors.New(serial.Concat(errs...)))
 	}
