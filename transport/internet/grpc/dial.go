@@ -5,6 +5,8 @@ import (
 	"crypto/md5"
 	"fmt"
 	gonet "net"
+	"os"
+	"strconv"
 	"time"
 
 	c "github.com/xtls/xray-core/common/ctx"
@@ -77,12 +79,45 @@ func (d dialerConf) generateCacheKey() string {
 }
 
 var (
-	ClientConnIdleTimeout = 1 * time.Minute
-
-	ReadBufSize  = 2 * 1024
-	WriteBufSize = 2 * 1024
-	ConnWindow   = 64 * 1024
+	ClientConnIdleTimeout = 30 * time.Second
+	ReadBufSize           = 2 * 1024
+	WriteBufSize          = 2 * 1024
+	ConnWindowSize        = 32 * 1024
 )
+
+func init() {
+	timeout := os.Getenv("XRAY-GRPC-IDLE-TIMEOUT")
+	if timeout != "" {
+		d, err := time.ParseDuration(timeout)
+		if err == nil && d > 0 {
+			ClientConnIdleTimeout = d
+		}
+	}
+
+	buf := os.Getenv("XRAY-GRPC-READ-BUF-SIZE")
+	if buf != "" {
+		i, err := strconv.Atoi(buf)
+		if err == nil && i > 0 {
+			ReadBufSize = i
+		}
+	}
+
+	buf = os.Getenv("XRAY-GRPC-WRITE-BUF-SIZE")
+	if buf != "" {
+		i, err := strconv.Atoi(buf)
+		if err == nil && i > 0 {
+			WriteBufSize = i
+		}
+	}
+
+	buf = os.Getenv("XRAY-GRPC-CONN-WINDOWS-SIZE")
+	if buf != "" {
+		i, err := strconv.Atoi(buf)
+		if err == nil && i > 0 {
+			ConnWindowSize = i
+		}
+	}
+}
 
 func dialgRPC(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (net.Conn, error) {
 	grpcSettings := streamSettings.ProtocolSettings.(*Config)
@@ -178,7 +213,7 @@ func createGrpcConnection(
 		}),
 		grpc.WithReadBufferSize(ReadBufSize),
 		grpc.WithWriteBufferSize(WriteBufSize),
-		grpc.WithInitialConnWindowSize(int32(ConnWindow)),
+		grpc.WithInitialConnWindowSize(int32(ConnWindowSize)),
 		grpc.WithContextDialer(func(gctx context.Context, s string) (gonet.Conn, error) {
 			select {
 			case <-gctx.Done():
