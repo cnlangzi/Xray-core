@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/md5"
 	"fmt"
-	gonet "net"
 	"os"
 	"strconv"
 	"time"
@@ -201,6 +200,7 @@ func createGrpcConnection(
 	sockopt *internet.SocketConfig,
 	grpcSettings *Config,
 ) (*grpc.ClientConn, error) {
+
 	dialOptions := []grpc.DialOption{
 		grpc.WithConnectParams(grpc.ConnectParams{
 			Backoff: backoff.Config{
@@ -214,7 +214,12 @@ func createGrpcConnection(
 		grpc.WithReadBufferSize(ReadBufSize),
 		grpc.WithWriteBufferSize(WriteBufSize),
 		grpc.WithInitialConnWindowSize(int32(ConnWindowSize)),
-		grpc.WithContextDialer(func(gctx context.Context, s string) (gonet.Conn, error) {
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                10 * time.Second, // Send ping if no Activity within 10 seconds
+			Timeout:             3 * time.Second,  // Timeout for waiting ping ack
+			PermitWithoutStream: true,             // Send ping even without active streams
+		}),
+		grpc.WithContextDialer(func(gctx context.Context, s string) (net.Conn, error) {
 			select {
 			case <-gctx.Done():
 				return nil, gctx.Err()
@@ -298,7 +303,7 @@ func createGrpcConnection(
 		grpcDestHost = dest.Address.IP().String()
 	}
 
-	conn, err := grpc.Dial(gonet.JoinHostPort(grpcDestHost, dest.Port.String()),
+	conn, err := grpc.Dial(net.JoinHostPort(grpcDestHost, dest.Port.String()),
 		dialOptions...,
 	)
 
