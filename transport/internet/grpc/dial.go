@@ -2,19 +2,24 @@ package grpc
 
 import (
 	"context"
-	"sync"
+	"crypto/md5"
+	"fmt"
+	"os"
+	"strconv"
 	"time"
 
-	"github.com/xtls/xray-core/common"
 	c "github.com/xtls/xray-core/common/ctx"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/features/store"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/grpc/encoding"
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
+
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/connectivity"
@@ -32,19 +37,86 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	return stat.Connection(conn), nil
 }
 
-func init() {
-	common.Must(internet.RegisterTransportDialer(protocolName, Dial))
-}
-
 type dialerConf struct {
 	net.Destination
 	*internet.MemoryStreamConfig
 }
 
+// generateCacheKey creates a content-based cache key for gRPC connections
+func (d dialerConf) generateCacheKey() string {
+	// Create a string representation of the key components
+	keyStr := fmt.Sprintf("%s:%s:%s:%s:%s",
+		d.Address.String(),
+		d.Port.String(),
+		d.Network.String(),
+		d.ProtocolName,
+		d.SecurityType,
+	)
+
+	// Add protocol-specific settings hash if available
+	if grpcSettings, ok := d.ProtocolSettings.(*Config); ok {
+		keyStr += fmt.Sprintf(":%s:%s:%t:%d:%d:%t",
+			grpcSettings.ServiceName,
+			grpcSettings.Authority,
+			grpcSettings.MultiMode,
+			grpcSettings.IdleTimeout,
+			grpcSettings.HealthCheckTimeout,
+			grpcSettings.PermitWithoutStream,
+		)
+	}
+
+	// Add security settings hash
+	if d.SecuritySettings != nil {
+		if tlsConfig, ok := d.SecuritySettings.(*tls.Config); ok {
+			keyStr += fmt.Sprintf(":tls:%s:%s", tlsConfig.ServerName, tlsConfig.Fingerprint)
+		}
+	}
+
+	// Generate MD5 hash of the key string
+	hash := md5.Sum([]byte(keyStr))
+	return fmt.Sprintf("%x", hash)
+}
+
 var (
-	globalDialerMap    map[dialerConf]*grpc.ClientConn
-	globalDialerAccess sync.Mutex
+	ClientConnIdleTimeout = 30 * time.Second
+	ReadBufSize           = 2 * 1024
+	WriteBufSize          = 2 * 1024
+	ConnWindowSize        = 32 * 1024
 )
+
+func init() {
+	timeout := os.Getenv("XRAY-GRPC-IDLE-TIMEOUT")
+	if timeout != "" {
+		d, err := time.ParseDuration(timeout)
+		if err == nil && d > 0 {
+			ClientConnIdleTimeout = d
+		}
+	}
+
+	buf := os.Getenv("XRAY-GRPC-READ-BUF-SIZE")
+	if buf != "" {
+		i, err := strconv.Atoi(buf)
+		if err == nil && i > 0 {
+			ReadBufSize = i
+		}
+	}
+
+	buf = os.Getenv("XRAY-GRPC-WRITE-BUF-SIZE")
+	if buf != "" {
+		i, err := strconv.Atoi(buf)
+		if err == nil && i > 0 {
+			WriteBufSize = i
+		}
+	}
+
+	buf = os.Getenv("XRAY-GRPC-CONN-WINDOWS-SIZE")
+	if buf != "" {
+		i, err := strconv.Atoi(buf)
+		if err == nil && i > 0 {
+			ConnWindowSize = i
+		}
+	}
+}
 
 func dialgRPC(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (net.Conn, error) {
 	grpcSettings := streamSettings.ProtocolSettings.(*Config)
@@ -53,6 +125,7 @@ func dialgRPC(ctx context.Context, dest net.Destination, streamSettings *interne
 	if err != nil {
 		return nil, errors.New("Cannot dial gRPC").Base(err)
 	}
+
 	client := encoding.NewGRPCServiceClient(conn)
 	if grpcSettings.MultiMode {
 		errors.LogDebug(ctx, "using gRPC multi mode service name: `"+grpcSettings.getServiceName()+"` stream name: `"+grpcSettings.getTunMultiStreamName()+"`")
@@ -60,6 +133,7 @@ func dialgRPC(ctx context.Context, dest net.Destination, streamSettings *interne
 		if err != nil {
 			return nil, errors.New("Cannot dial gRPC").Base(err)
 		}
+
 		return encoding.NewMultiHunkConn(grpcService, nil), nil
 	}
 
@@ -73,20 +147,59 @@ func dialgRPC(ctx context.Context, dest net.Destination, streamSettings *interne
 }
 
 func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (*grpc.ClientConn, error) {
-	globalDialerAccess.Lock()
-	defer globalDialerAccess.Unlock()
-
-	if globalDialerMap == nil {
-		globalDialerMap = make(map[dialerConf]*grpc.ClientConn)
+	// Try to get store from features
+	var st *store.Store
+	if instance := core.FromContext(ctx); instance != nil {
+		if s := instance.GetFeature(store.Type()); s != nil {
+			st = s.(*store.Store)
+		}
 	}
+
 	tlsConfig := tls.ConfigFromStreamSettings(streamSettings)
 	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
 	sockopt := streamSettings.SocketSettings
 	grpcSettings := streamSettings.ProtocolSettings.(*Config)
 
-	if client, found := globalDialerMap[dialerConf{dest, streamSettings}]; found && client.GetState() != connectivity.Shutdown {
-		return client, nil
+	// Generate cache key once for both Get and Put operations
+	key := dialerConf{dest, streamSettings}.generateCacheKey()
+
+	// If store is available, try to get stored connection
+	if st != nil {
+		if it, found := st.Get(key); found {
+			if conn, ok := it.(*grpc.ClientConn); ok {
+				state := conn.GetState()
+				// Only reuse if connection is healthy
+				if state != connectivity.Shutdown && state != connectivity.TransientFailure {
+					return conn, nil
+				}
+				// Connection is unhealthy, will be replaced by new connection below
+			}
+		}
 	}
+
+	// Create new connection
+	conn, err := createGrpcConnection(ctx, dest, tlsConfig, realityConfig, sockopt, grpcSettings)
+	if err != nil {
+		return nil, err
+	}
+
+	// Store connection if store is available
+	if st != nil {
+		st.Put(key, conn)
+	}
+
+	return conn, nil
+}
+
+// createGrpcConnection creates a new gRPC client connection
+func createGrpcConnection(
+	ctx context.Context,
+	dest net.Destination,
+	tlsConfig *tls.Config,
+	realityConfig *reality.Config,
+	sockopt *internet.SocketConfig,
+	grpcSettings *Config,
+) (*grpc.ClientConn, error) {
 
 	dialOptions := []grpc.DialOption{
 		grpc.WithConnectParams(grpc.ConnectParams{
@@ -97,6 +210,14 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 				MaxDelay:   19 * time.Second,
 			},
 			MinConnectTimeout: 5 * time.Second,
+		}),
+		grpc.WithReadBufferSize(ReadBufSize),
+		grpc.WithWriteBufferSize(WriteBufSize),
+		grpc.WithInitialConnWindowSize(int32(ConnWindowSize)),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                10 * time.Second, // Send ping if no Activity within 10 seconds
+			Timeout:             3 * time.Second,  // Timeout for waiting ping ack
+			PermitWithoutStream: true,             // Send ping even without active streams
 		}),
 		grpc.WithContextDialer(func(gctx context.Context, s string) (net.Conn, error) {
 			select {
@@ -145,6 +266,10 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 
 	dialOptions = append(dialOptions, grpc.WithTransportCredentials(insecure.NewCredentials()))
 
+	if ClientConnIdleTimeout > 0 {
+		dialOptions = append(dialOptions, grpc.WithIdleTimeout(ClientConnIdleTimeout))
+	}
+
 	authority := ""
 	if grpcSettings.Authority != "" {
 		authority = grpcSettings.Authority
@@ -178,10 +303,9 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 		grpcDestHost = dest.Address.IP().String()
 	}
 
-	conn, err := grpc.Dial(
-		net.JoinHostPort(grpcDestHost, dest.Port.String()),
+	conn, err := grpc.Dial(net.JoinHostPort(grpcDestHost, dest.Port.String()),
 		dialOptions...,
 	)
-	globalDialerMap[dialerConf{dest, streamSettings}] = conn
+
 	return conn, err
 }

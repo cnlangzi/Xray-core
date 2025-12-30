@@ -17,6 +17,7 @@ import (
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/features/stats"
+	"github.com/xtls/xray-core/features/store"
 	"github.com/xtls/xray-core/transport/internet"
 )
 
@@ -210,6 +211,7 @@ func initInstanceWithConfig(config *Config, server *Instance) (bool, error) {
 		Type     interface{}
 		Instance features.Feature
 	}{
+		{store.Type(), store.New()},
 		{dns.ClientType(), localdns.New()},
 		{policy.ManagerType(), policy.DefaultManager{}},
 		{routing.RouterType(), routing.DefaultRouter{}},
@@ -267,6 +269,7 @@ func (s *Instance) Close() error {
 			errs = append(errs, err)
 		}
 	}
+
 	if len(errs) > 0 {
 		return errors.New("failed to close all features").Base(errors.New(serial.Concat(errs...)))
 	}
